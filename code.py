@@ -1,181 +1,329 @@
+import numpy as np
+import gym
 import torch
 import torch.nn as nn
 import torch.optim as optim
-import numpy as np
-import gym
-import torch_xla.core.xla_model as xm  # For TPU handling
-import torch_xla.utils.serialization as xser
+import random
+from collections import deque
 
-# input warehouse environment
+# ===========================
+# Device Configuration
+# ===========================
+device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+print(f"Using device: {device}")
+
+# ===========================
+# Prioritized Experience Replay Buffer
+# ===========================
+class PrioritizedReplayBuffer:
+    def __init__(self, buffer_size, batch_size, alpha=0.6):
+        self.buffer_size = buffer_size
+        self.batch_size = batch_size
+        self.alpha = alpha
+        self.buffer = []
+        self.pos = 0
+        self.priorities = np.zeros((buffer_size,), dtype=np.float32)
+
+    def add(self, state, action, reward, next_state, done):
+        max_prio = self.priorities.max() if self.buffer else 1.0
+        if len(self.buffer) < self.buffer_size:
+            self.buffer.append((state, action, reward, next_state, done))
+        else:
+            self.buffer[self.pos] = (state, action, reward, next_state, done)
+        self.priorities[self.pos] = max_prio
+        self.pos = (self.pos + 1) % self.buffer_size
+
+    def sample(self, beta=0.4):
+        if len(self.buffer) == self.buffer_size:
+            prios = self.priorities
+        else:
+            prios = self.priorities[:self.pos]
+        probs = prios ** self.alpha
+        probs /= probs.sum()
+        indices = np.random.choice(len(self.buffer), self.batch_size, p=probs)
+        samples = [self.buffer[idx] for idx in indices]
+        total = len(self.buffer)
+        weights = (total * probs[indices]) ** (-beta)
+        weights /= weights.max()
+        batch = list(zip(*samples))
+        states, actions, rewards, next_states, dones = batch
+        return (
+            torch.FloatTensor(np.array(states)).to(device),
+            torch.LongTensor(actions).to(device),
+            torch.FloatTensor(rewards).to(device),
+            torch.FloatTensor(np.array(next_states)).to(device),
+            torch.FloatTensor(dones).to(device),
+            indices,
+            torch.FloatTensor(weights).to(device)
+        )
+
+    def update_priorities(self, indices, priorities):
+        for idx, prio in zip(indices, priorities):
+            self.priorities[idx] = prio
+
+    def __len__(self):
+        return len(self.buffer)
+
+# ===========================
+# Dueling Q-Network
+# ===========================
+class DuelingQNetwork(nn.Module):
+    def __init__(self, state_size, action_size):
+        super(DuelingQNetwork, self).__init__()
+        self.fc1 = nn.Linear(state_size, 128)
+        self.fc2 = nn.Linear(128, 128)
+        # Value and Advantage streams
+        self.value_stream = nn.Linear(128, 1)
+        self.advantage_stream = nn.Linear(128, action_size)
+
+    def forward(self, state):
+        x = torch.relu(self.fc1(state))
+        x = torch.relu(self.fc2(x))
+        value = self.value_stream(x)
+        advantage = self.advantage_stream(x)
+        q_vals = value + (advantage - advantage.mean())
+        return q_vals
+
+# ===========================
+# Independent Q-Learning Agent
+# ===========================
+class IQLAgent:
+    def __init__(self, state_size, action_size, lr=1e-3, gamma=0.99, tau=1e-3, buffer_size=10000, batch_size=64, alpha=0.6, beta_start=0.4, beta_frames=100000):
+        self.state_size = state_size
+        self.action_size = action_size
+        self.gamma = gamma
+        self.tau = tau
+        self.batch_size = batch_size
+
+        self.q_network = DuelingQNetwork(state_size, action_size).to(device)
+        self.target_network = DuelingQNetwork(state_size, action_size).to(device)
+        self.target_network.load_state_dict(self.q_network.state_dict())
+        self.target_network.eval()
+
+        self.optimizer = optim.Adam(self.q_network.parameters(), lr=lr)
+        self.replay_buffer = PrioritizedReplayBuffer(buffer_size, batch_size)
+
+        self.epsilon = 1.0
+        self.epsilon_min = 0.05
+        self.epsilon_decay = 0.995
+
+        self.beta = beta_start
+        self.beta_increment = (1.0 - beta_start) / beta_frames
+
+    def choose_action(self, state, evaluate=False):
+        if evaluate or random.random() > self.epsilon:
+            state = torch.FloatTensor(state).unsqueeze(0).to(device)
+            with torch.no_grad():
+                q_values = self.q_network(state)
+            action = torch.argmax(q_values).item()
+        else:
+            action = random.randrange(self.action_size)
+        return action
+
+    def step(self, state, action, reward, next_state, done):
+        self.replay_buffer.add(state, action, reward, next_state, done)
+        if self.epsilon > self.epsilon_min:
+            self.epsilon *= self.epsilon_decay
+
+        # Update beta for prioritized replay
+        self.beta = min(1.0, self.beta + self.beta_increment)
+
+        self.learn()
+
+    def learn(self):
+        if len(self.replay_buffer) < self.batch_size:
+            return
+
+        states, actions, rewards, next_states, dones, indices, weights = self.replay_buffer.sample()
+
+        # Compute Q-values for current states
+        q_values = self.q_network(states)
+        q_values_next = self.target_network(next_states)
+
+        # Compute target Q-values
+        target_q_values = rewards + (self.gamma * q_values_next.max(1)[0] * (1 - dones))
+
+        # Compute TD error
+        td_errors = target_q_values - q_values.gather(1, actions.unsqueeze(1)).squeeze(1)
+
+        # Update priorities
+        new_priorities = td_errors.abs().detach().cpu().numpy() + 1e-6
+        self.replay_buffer.update_priorities(indices, new_priorities)
+
+        # Optimize Q-Network
+        loss = (td_errors ** 2 * weights).mean()
+
+        self.optimizer.zero_grad()
+        loss.backward()
+        self.optimizer.step()
+
+        # Soft update of target network
+        for target_param, local_param in zip(self.target_network.parameters(), self.q_network.parameters()):
+            target_param.data.copy_(self.tau * local_param.data + (1.0 - self.tau) * target_param.data)
+
+# ===========================
+# Warehouse Environment
+# ===========================
 class WarehouseEnv(gym.Env):
-    def __init__(self, grid_size=(2, 2), num_autobots=1):
+    def __init__(self, grid, num_autobots):
         super(WarehouseEnv, self).__init__()
-        self.grid_size = grid_size
+        self.grid = grid
         self.num_autobots = num_autobots
-        self.action_space = gym.spaces.Discrete(5)  # forward, reverse, left turn, right turn, wait
-        self.observation_space = gym.spaces.Box(low=0, high=1, shape=(self.grid_size[0], self.grid_size[1], 1), dtype=np.float32)
-        self.reset()
+        self.start_positions = self.find_positions('A')
+        self.end_positions = self.find_positions('B')
+        self.obstacles = self.find_positions('X')
+        self.autobot_positions = self.start_positions.copy()
+
+        self.action_space = gym.spaces.MultiDiscrete([5] * num_autobots)
+        self.observation_space = gym.spaces.Box(low=0, high=len(grid), shape=(num_autobots, 2), dtype=np.int32)
 
     def reset(self):
-        self.grid = np.zeros(self.grid_size)
-        self.autobot_positions = [(0, 0)]  # Starting position of the autobot
-        self.autobot_directions = [0]  # Initial direction (0: up, 1: right, 2: down, 3: left)
-        self.destinations = [(1, 1)]  # Destination point
-        self.obstacles = [(0, 1)]  # Obstacle positions
-        for obs in self.obstacles:
-            self.grid[obs] = -1  # Mark obstacles on the grid
-        self.steps_taken = 0
-        return self.grid, self.autobot_positions
+        self.autobot_positions = self.start_positions.copy()
+        self.done = [False] * self.num_autobots
+        return self._get_observation()
 
     def step(self, actions):
         rewards = []
         for i, action in enumerate(actions):
-            reward, done = self._move_bot(i, action)
-            rewards.append(reward)
-        self.steps_taken += 1
+            if not self.done[i]:
+                rewards.append(self._move_autobot(i, action))
+            else:
+                rewards.append(0)
         total_reward = sum(rewards)
-        done = all([self.autobot_positions[i] == self.destinations[i] for i in range(self.num_autobots)])
-        return self.grid, total_reward, done, {}
+        return self._get_observation(), total_reward, all(self.done), {}
 
-    def _move_bot(self, bot_id, action):
-        current_pos = self.autobot_positions[bot_id]
-        current_dir = self.autobot_directions[bot_id]
-        new_pos = current_pos
+    def _move_autobot(self, index, action):
+        current_pos = self.autobot_positions[index]
+        new_pos = list(current_pos)
 
-        if action == 0:  # Move forward
-            if current_dir == 0 and current_pos[0] > 0:  # Up
-                new_pos = (current_pos[0] - 1, current_pos[1])
-            elif current_dir == 1 and current_pos[1] < self.grid_size[1] - 1:  # Right
-                new_pos = (current_pos[0], current_pos[1] + 1)
-            elif current_dir == 2 and current_pos[0] < self.grid_size[0] - 1:  # Down
-                new_pos = (current_pos[0] + 1, current_pos[1])
-            elif current_dir == 3 and current_pos[1] > 0:  # Left
-                new_pos = (current_pos[0], current_pos[1] - 1)
-        elif action == 1:  # Move backward
-            if current_dir == 0 and current_pos[0] < self.grid_size[0] - 1:  # Down
-                new_pos = (current_pos[0] + 1, current_pos[1])
-            elif current_dir == 1 and current_pos[1] > 0:  # Left
-                new_pos = (current_pos[0], current_pos[1] - 1)
-            elif current_dir == 2 and current_pos[0] > 0:  # Up
-                new_pos = (current_pos[0] - 1, current_pos[1])
-            elif current_dir == 3 and current_pos[1] < self.grid_size[1] - 1:  # Right
-                new_pos = (current_pos[0], current_pos[1] + 1)
-        elif action == 2:  # Turn left
-            self.autobot_directions[bot_id] = (current_dir - 1) % 4
-        elif action == 3:  # Turn right
-            self.autobot_directions[bot_id] = (current_dir + 1) % 4
+        # Implement movement logic
+        if action == 0:
+            new_pos[0] = max(0, current_pos[0] - 1)
+        elif action == 1:
+            new_pos[0] = min(len(self.grid) - 1, current_pos[0] + 1)
+        elif action == 2:
+            new_pos[1] = max(0, current_pos[1] - 1)
+        elif action == 3:
+            new_pos[1] = min(len(self.grid[0]) - 1, current_pos[1] + 1)
+        elif action == 4:
+            new_pos = current_pos
 
-        # Collision or obstacle check
-        if new_pos in self.obstacles:
-            reward = -5  # Penalty for hitting obstacle
-        else:
-            self.autobot_positions[bot_id] = new_pos
-            reward = 10 if new_pos == self.destinations[bot_id] else -1  # Reward for reaching the destination or penalty for step
+        # Check for collisions with obstacles or other autobots
+        if tuple(new_pos) in self.obstacles or (tuple(new_pos) in self.autobot_positions and tuple(new_pos) not in self.end_positions):
+            return -10  # Penalty for collision or moving into obstacle
 
-        done = new_pos == self.destinations[bot_id]
-        return reward, done
+        # Check if the autobot reached its destination
+        if tuple(new_pos) == self.end_positions[index]:
+            self.done[index] = True
+            return 100  # Reward for reaching the destination
+
+        # Update the position
+        self.autobot_positions[index] = tuple(new_pos)
+        return -1  # Small penalty for each move
+
+    def _get_observation(self):
+        # Return the current positions for all autobots
+        return np.array(self.autobot_positions)
+
+    def find_positions(self, symbol):
+        return [(i, j) for i in range(len(self.grid)) for j in range(len(self.grid[0])) if self.grid[i][j] == symbol]
 
     def render(self, mode='human'):
-        grid_display = np.copy(self.grid)
-        for i, pos in enumerate(self.autobot_positions):
-            grid_display[pos] = i + 1  # Autobots represented as 1, 2, etc.
-        print(grid_display)
+        grid_display = [['.' for _ in range(len(self.grid[0]))] for _ in range(len(self.grid))]
+        # Mark obstacles
+        for obs in self.obstacles:
+            grid_display[obs[0]][obs[1]] = 'X'
+        # Mark destinations
+        for idx, pos in enumerate(self.end_positions):
+            grid_display[pos[0]][pos[1]] = 'B'
+        # Mark autobots
+        for idx, pos in enumerate(self.autobot_positions):
+            grid_display[pos[0]][pos[1]] = str(idx + 1)
+        # Print the grid
+        for row in grid_display:
+            print(' '.join(row))
+        print()
 
-# Optimized MAPPO Actor-Critic Network
-class MAPPOActorCritic(nn.Module):
-    def __init__(self, input_shape, n_actions):
-        super(MAPPOActorCritic, self).__init__()
-        # Reduced network complexity
-        self.fc1 = nn.Linear(input_shape, 64)  # Reduced neurons
-        self.fc2 = nn.Linear(64, 64)  # Reduced neurons
-        self.policy = nn.Linear(64, n_actions)
-        self.value = nn.Linear(64, 1)
-
-    def forward(self, x):
-        x = torch.relu(self.fc1(x))
-        x = torch.relu(self.fc2(x))
-        policy = self.policy(x)
-        value = self.value(x)
-        return policy, value
-
-# MAPPO Agent with Optimized Training
-class MAPPOAgent:
-    def __init__(self, env):
-        self.env = env
-        self.policy_network = MAPPOActorCritic(env.observation_space.shape[0] * env.observation_space.shape[1], env.action_space.n).to(xm.xla_device())
-        self.optimizer = optim.Adam(self.policy_network.parameters(), lr=0.0005)  # Lower learning rate for stability
-        self.gamma = 0.95  # Discount factor reduced to stabilize training and make convergence faster
-
-    def choose_action(self, state):
-        state = torch.FloatTensor(state).flatten().to(xm.xla_device())
-        policy, _ = self.policy_network(state)
-        action_prob = torch.softmax(policy, dim=-1)
-        action = torch.argmax(action_prob).item()
-        return action
-
-    def train(self, num_episodes, early_stop_threshold=10):
-        running_avg_reward = 0
-        early_stop_count = 0
-        for episode in range(num_episodes):
-            state, autobot_positions = self.env.reset()
-            done = False
-            episode_reward = 0
-            step_count = 0  # Limit steps per episode to optimize computation
-            while not done and step_count < 50:  # Limit steps
-                actions = [self.choose_action(state)]
-                next_state, reward, done, _ = self.env.step(actions)
-                episode_reward += reward
-
-                # Calculate advantage
-                _, next_value = self.policy_network(torch.FloatTensor(next_state).flatten().to(xm.xla_device()))
-                _, value = self.policy_network(torch.FloatTensor(state).flatten().to(xm.xla_device()))
-                advantage = reward + self.gamma * next_value - value
-
-                # Compute policy loss and value loss
-                policy, value = self.policy_network(torch.FloatTensor(state).flatten().to(xm.xla_device()))
-                action_probs = torch.softmax(policy, dim=-1)
-                policy_loss = -torch.log(action_probs[actions[0]]) * advantage
-                value_loss = advantage ** 2
-
-                loss = policy_loss + value_loss
-
-                # Backpropagate loss and update network weights
-                self.optimizer.zero_grad()
-                loss.backward()
-                xm.optimizer_step(self.optimizer)  # TPU-optimized step
-
-                state = next_state
-                step_count += 1
-
-            # Early stopping if performance plateaus
-            running_avg_reward = 0.9 * running_avg_reward + 0.1 * episode_reward
-            if abs(episode_reward - running_avg_reward) < early_stop_threshold:
-                early_stop_count += 1
-            else:
-                early_stop_count = 0
-
-            if early_stop_count > 10:
-                print(f"Early stopping at episode {episode + 1}")
+# ===========================
+# Training Loop
+# ===========================
+def train_iql(env, agents, num_episodes=500, max_steps=50):
+    for episode in range(1, num_episodes + 1):
+        state = env.reset()
+        episode_reward = 0
+        for step in range(max_steps):
+            actions = []
+            # Choose actions for each agent
+            for agent_idx, agent in enumerate(agents):
+                agent_state = state[agent_idx]  # Each agent observes its own position
+                actions.append(agent.choose_action(agent_state))
+            # Execute actions in the environment
+            next_state, reward, done_flag, _ = env.step(actions)
+            episode_reward += reward
+            # Store experiences and train each agent
+            for agent_idx, agent in enumerate(agents):
+                agent_state = state[agent_idx]
+                agent_action = actions[agent_idx]
+                agent_reward = reward
+                agent_next_state = next_state[agent_idx]
+                agent_done = done_flag
+                agent.step(agent_state, agent_action, agent_reward, agent_next_state, agent_done)
+            state = next_state
+            if done_flag:
                 break
+        print(f"Episode {episode}/{num_episodes}, Total Reward: {episode_reward}, Epsilon: {agents[0].epsilon:.2f}")
 
-            print(f"Episode {episode+1}, Reward: {episode_reward}")
-
-# Instantiate the environment
-env = WarehouseEnv(grid_size=(2, 2), num_autobots=1)
-
-# Instantiate and train the MAPPO agent with optimization
-agent = MAPPOAgent(env)
-agent.train(num_episodes=200)  # Reduced number of episodes
-
-# Run simulation with the trained agent
-state, autobot_positions = env.reset()
-done = False
-while not done:
+# ===========================
+# Simulation with Trained Agents
+# ===========================
+def simulate(env, agents):
+    state = env.reset()
+    done = False
+    step = 0
+    while not done and step < 100:
+        env.render()
+        actions = []
+        for agent_idx, agent in enumerate(agents):
+            action = agent.choose_action(state[agent_idx], evaluate=True)
+            actions.append(action)
+        next_state, reward, done, _ = env.step(actions)
+        state = next_state
+        step += 1
     env.render()
-    actions = []
-    for autobot in autobot_positions:
-        action = agent.choose_action(state)
-        actions.append(action)
-    state, reward, done, _ = env.step(actions)
+    if done:
+        print("All autobots reached their destinations!")
+    else:
+        print("Simulation ended without all autobots reaching their destinations.")
 
-print(" The Simulation is completed.")
+# ===========================
+# Main Execution
+# ===========================
+if __name__ == "__main__":
+    # Define the grid layout (5x5 grid)
+    grid = [
+        ['A', '.', '.', 'X', 'B'],
+        ['.', 'X', '.', '.', '.'],
+        ['.', '.', 'X', '.', '.'],
+        ['.', '.', '.', 'X', '.'],
+        ['A', 'X', '.', '.', 'B']
+    ]
+    num_autobots = 2
+    env = WarehouseEnv(grid, num_autobots)
+
+    # Determine state size and action size for agents
+    state_size = env.observation_space.shape[1]
+    action_size = env.action_space.nvec[0]
+
+    # Instantiate IQL agents for each autobot
+    agents = [IQLAgent(state_size=state_size, action_size=action_size) for _ in range(env.num_autobots)]
+
+    # Train the agents
+    print("Starting Training...")
+    train_iql(env, agents, num_episodes=500, max_steps=50)
+    print("Training Completed.")
+
+    # Run simulation with trained agents
+    print("Starting Simulation with Trained Agents...")
+    simulate(env, agents)
+    print("Simulation complete.")
+
