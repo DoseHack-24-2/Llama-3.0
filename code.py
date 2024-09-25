@@ -4,11 +4,9 @@ import torch.optim as optim
 import numpy as np
 import gym
 import torch_xla.core.xla_model as xm  # For TPU handling
-import torch_xla.distributed.data_parallel as dp
-import torch_xla.distributed.parallel_loader as pl
 import torch_xla.utils.serialization as xser
 
-# Define the Warehouse environment
+# input warehouse environment
 class WarehouseEnv(gym.Env):
     def __init__(self, grid_size=(2, 2), num_autobots=1):
         super(WarehouseEnv, self).__init__()
@@ -42,6 +40,7 @@ class WarehouseEnv(gym.Env):
     def _move_bot(self, bot_id, action):
         current_pos = self.autobot_positions[bot_id]
         current_dir = self.autobot_directions[bot_id]
+        new_pos = current_pos
 
         if action == 0:  # Move forward
             if current_dir == 0 and current_pos[0] > 0:  # Up
@@ -52,8 +51,6 @@ class WarehouseEnv(gym.Env):
                 new_pos = (current_pos[0] + 1, current_pos[1])
             elif current_dir == 3 and current_pos[1] > 0:  # Left
                 new_pos = (current_pos[0], current_pos[1] - 1)
-            else:
-                new_pos = current_pos
         elif action == 1:  # Move backward
             if current_dir == 0 and current_pos[0] < self.grid_size[0] - 1:  # Down
                 new_pos = (current_pos[0] + 1, current_pos[1])
@@ -63,29 +60,19 @@ class WarehouseEnv(gym.Env):
                 new_pos = (current_pos[0] - 1, current_pos[1])
             elif current_dir == 3 and current_pos[1] < self.grid_size[1] - 1:  # Right
                 new_pos = (current_pos[0], current_pos[1] + 1)
-            else:
-                new_pos = current_pos
         elif action == 2:  # Turn left
-            new_pos = current_pos
             self.autobot_directions[bot_id] = (current_dir - 1) % 4
         elif action == 3:  # Turn right
-            new_pos = current_pos
             self.autobot_directions[bot_id] = (current_dir + 1) % 4
-        else:  # Wait
-            new_pos = current_pos
 
+        # Collision or obstacle check
         if new_pos in self.obstacles:
             reward = -5  # Penalty for hitting obstacle
-            new_pos = current_pos  # Stay in place
         else:
-            reward = -1  # Small penalty for every step
+            self.autobot_positions[bot_id] = new_pos
+            reward = 10 if new_pos == self.destinations[bot_id] else -1  # Reward for reaching the destination or penalty for step
 
-        self.autobot_positions[bot_id] = new_pos
-        if new_pos == self.destinations[bot_id]:
-            reward = 10  # Reward for reaching destination
-            done = True
-        else:
-            done = False
+        done = new_pos == self.destinations[bot_id]
         return reward, done
 
     def render(self, mode='human'):
@@ -94,14 +81,15 @@ class WarehouseEnv(gym.Env):
             grid_display[pos] = i + 1  # Autobots represented as 1, 2, etc.
         print(grid_display)
 
-# MAPPO Actor-Critic Network
+# Optimized MAPPO Actor-Critic Network
 class MAPPOActorCritic(nn.Module):
     def __init__(self, input_shape, n_actions):
         super(MAPPOActorCritic, self).__init__()
-        self.fc1 = nn.Linear(input_shape, 128)
-        self.fc2 = nn.Linear(128, 128)
-        self.policy = nn.Linear(128, n_actions)
-        self.value = nn.Linear(128, 1)
+        # Reduced network complexity
+        self.fc1 = nn.Linear(input_shape, 64)  # Reduced neurons
+        self.fc2 = nn.Linear(64, 64)  # Reduced neurons
+        self.policy = nn.Linear(64, n_actions)
+        self.value = nn.Linear(64, 1)
 
     def forward(self, x):
         x = torch.relu(self.fc1(x))
@@ -110,13 +98,13 @@ class MAPPOActorCritic(nn.Module):
         value = self.value(x)
         return policy, value
 
-# MAPPO Agent Definition
+# MAPPO Agent with Optimized Training
 class MAPPOAgent:
     def __init__(self, env):
         self.env = env
         self.policy_network = MAPPOActorCritic(env.observation_space.shape[0] * env.observation_space.shape[1], env.action_space.n).to(xm.xla_device())
-        self.optimizer = optim.Adam(self.policy_network.parameters(), lr=0.001)
-        self.gamma = 0.99  # Discount factor for future rewards
+        self.optimizer = optim.Adam(self.policy_network.parameters(), lr=0.0005)  # Lower learning rate for stability
+        self.gamma = 0.95  # Discount factor reduced to stabilize training and make convergence faster
 
     def choose_action(self, state):
         state = torch.FloatTensor(state).flatten().to(xm.xla_device())
@@ -125,16 +113,16 @@ class MAPPOAgent:
         action = torch.argmax(action_prob).item()
         return action
 
-    def train(self, num_episodes):
+    def train(self, num_episodes, early_stop_threshold=10):
+        running_avg_reward = 0
+        early_stop_count = 0
         for episode in range(num_episodes):
             state, autobot_positions = self.env.reset()
             done = False
             episode_reward = 0
-            while not done:
-                actions = []
-                for autobot in autobot_positions:
-                    action = self.choose_action(state)
-                    actions.append(action)
+            step_count = 0  # Limit steps per episode to optimize computation
+            while not done and step_count < 50:  # Limit steps
+                actions = [self.choose_action(state)]
                 next_state, reward, done, _ = self.env.step(actions)
                 episode_reward += reward
 
@@ -157,17 +145,29 @@ class MAPPOAgent:
                 xm.optimizer_step(self.optimizer)  # TPU-optimized step
 
                 state = next_state
+                step_count += 1
+
+            # Early stopping if performance plateaus
+            running_avg_reward = 0.9 * running_avg_reward + 0.1 * episode_reward
+            if abs(episode_reward - running_avg_reward) < early_stop_threshold:
+                early_stop_count += 1
+            else:
+                early_stop_count = 0
+
+            if early_stop_count > 10:
+                print(f"Early stopping at episode {episode + 1}")
+                break
 
             print(f"Episode {episode+1}, Reward: {episode_reward}")
 
 # Instantiate the environment
 env = WarehouseEnv(grid_size=(2, 2), num_autobots=1)
 
-# Instantiate and train the MAPPO agent
+# Instantiate and train the MAPPO agent with optimization
 agent = MAPPOAgent(env)
-agent.train(num_episodes=500)
+agent.train(num_episodes=200)  # Reduced number of episodes
 
-# Run simulation with trained agent
+# Run simulation with the trained agent
 state, autobot_positions = env.reset()
 done = False
 while not done:
@@ -178,4 +178,4 @@ while not done:
         actions.append(action)
     state, reward, done, _ = env.step(actions)
 
-print("The simulation is done succesfully!!!!!")
+print(" The Simulation is completed.")
