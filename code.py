@@ -457,3 +457,18 @@ if __name__ == "__main__":
 
     save_model_to_pth(agents[0].q_network, "agent0_model.pth")
     print("Model saved to .pth")
+
+
+
+'''
+Output:
+
+. . . < . M
+X . X X . X
+. . . > . .
+X X . X X X
+. . . < . M
+X . X X . .
+. . . > . .
+
+'''
